@@ -27,7 +27,6 @@ import {
     ParamCategory,
     ParameterNode,
     ParseNode,
-    RaiseNode,
     StringNode,
 } from '../parser/parseNodes';
 import { AnalyzerFileInfo } from './analyzerFileInfo';
@@ -36,7 +35,7 @@ import { ConstraintTracker } from './constraintTracker';
 import { Declaration } from './declaration';
 import * as DeclarationUtils from './declarationUtils';
 import { SymbolWithScope } from './scope';
-import { Symbol } from './symbol';
+import { Symbol, SynthesizedTypeInfo } from './symbol';
 import { PrintTypeFlags } from './typePrinter';
 import {
     AnyType,
@@ -44,18 +43,23 @@ import {
     FunctionParam,
     FunctionType,
     OverloadedType,
+    TupleTypeArg,
     Type,
     TypeCondition,
-    TypeVarScopeId,
     TypeVarType,
     UnknownType,
     Variance,
 } from './types';
-import { AssignTypeFlags, ClassMember, InferenceContext, MemberAccessFlags } from './typeUtils';
+import { ApplyTypeVarOptions, ClassMember, InferenceContext, MemberAccessFlags } from './typeUtils';
 
 // Maximum number of unioned subtypes for an inferred type (e.g.
 // a list) before the type is considered an "Any".
 export const maxSubtypesForInferredType = 64;
+
+// In certain loops, it's possible to construct arbitrarily-deep containers
+// (tuples, lists, sets, or dicts) which can lead to infinite type analysis.
+// This limits the depth.
+export const maxInferredContainerDepth = 8;
 
 export const enum EvalFlags {
     None = 0,
@@ -120,6 +124,9 @@ export const enum EvalFlags {
     // Used for PEP 526-style variable type annotations.
     VarTypeAnnotation = 1 << 15,
 
+    // An ellipsis is allowed even if TypeExpression is set.
+    AllowEllipsis = 1 << 16,
+
     // 'ClassVar' is not allowed in this context.
     NoClassVar = 1 << 17,
 
@@ -133,16 +140,19 @@ export const enum EvalFlags {
     // Required and NotRequired are allowed in this context.
     AllowRequired = 1 << 20,
 
+    // ReadOnly is allowed in this context.
+    AllowReadOnly = 1 << 21,
+
     // Allow Unpack annotation for a tuple or TypeVarTuple.
-    AllowUnpackedTuple = 1 << 21,
+    AllowUnpackedTuple = 1 << 22,
 
     // Allow Unpack annotation for TypedDict.
-    AllowUnpackedTypedDict = 1 << 22,
+    AllowUnpackedTypedDict = 1 << 23,
 
     // Even though an expression is enclosed in a string literal,
     // the interpreter (within a source file, not a stub) still
     // parses the expression and generates parse errors.
-    ParsesStringLiteral = 1 << 23,
+    ParsesStringLiteral = 1 << 24,
 
     // Do not convert special forms to their corresponding runtime
     // objects even when expecting a type expression.
@@ -191,6 +201,26 @@ export const enum EvalFlags {
         IsinstanceArg,
 }
 
+// Types whose definitions are prefetched and cached by the type evaluator
+export interface PrefetchedTypes {
+    noneTypeClass: Type;
+    objectClass: Type;
+    typeClass: Type;
+    unionTypeClass: Type;
+    awaitableClass: Type;
+    functionClass: Type;
+    tupleClass: Type;
+    boolClass: Type;
+    intClass: Type;
+    strClass: Type;
+    dictClass: Type;
+    moduleTypeClass: Type;
+    typedDictClass: Type;
+    typedDictPrivateClass: Type;
+    supportsKeysAndGetItemClass: Type;
+    mappingClass: Type;
+}
+
 export interface TypeResult<T extends Type = Type> {
     type: T;
 
@@ -210,6 +240,9 @@ export interface TypeResult<T extends Type = Type> {
 
     // Type consistency errors detected when evaluating this type.
     typeErrors?: boolean | undefined;
+
+    // For inlined TypedDict definitions.
+    inlinedTypeDict?: ClassType;
 
     // Used for getTypeOfBoundMember to indicate that class
     // that declares the member.
@@ -352,6 +385,7 @@ export interface ValidateArgTypeParams {
 export interface ExpectedTypeOptions {
     allowFinal?: boolean;
     allowRequired?: boolean;
+    allowReadOnly?: boolean;
     allowUnpackedTuple?: boolean;
     allowUnpackedTypedDict?: boolean;
     allowParamSpec?: boolean;
@@ -367,6 +401,7 @@ export interface ExpectedTypeOptions {
     forwardRefs?: boolean;
     typeExpression?: boolean;
     convertEllipsisToAny?: boolean;
+    allowEllipsis?: boolean;
 }
 
 export interface ExpectedTypeResult {
@@ -456,17 +491,6 @@ export interface SolveConstraintsOptions {
     useLowerBoundOnly?: boolean;
 }
 
-export interface ApplyTypeVarOptions {
-    typeClassType?: ClassType;
-    replaceUnsolved?: {
-        scopeIds: TypeVarScopeId[];
-        tupleClassType: ClassType | undefined;
-        unsolvedExemptTypeVars?: TypeVarType[];
-        useUnknown?: boolean;
-        eliminateUnsolvedInUnions?: boolean;
-    };
-}
-
 export enum Reachability {
     Reachable,
     UnreachableAlways,
@@ -514,7 +538,83 @@ export interface CallSiteEvaluationInfo {
 
 export interface SymbolDeclInfo {
     decls: Declaration[];
-    synthesizedTypes: Type[];
+    synthesizedTypes: SynthesizedTypeInfo[];
+}
+
+export const enum AssignTypeFlags {
+    Default = 0,
+
+    // Require invariance with respect to class matching? Normally
+    // subclasses are allowed.
+    Invariant = 1 << 0,
+
+    // The caller has swapped the source and dest types because
+    // the types are contravariant. Perform type var matching
+    // on dest type vars rather than source type var.
+    Contravariant = 1 << 1,
+
+    // We're comparing type compatibility of two distinct recursive types.
+    // This has the potential of recursing infinitely. This flag allows us
+    // to detect the recursion after the first level of checking.
+    SkipRecursiveTypeCheck = 1 << 2,
+
+    // During TypeVar solving for a function call, this flag is set if
+    // this is the first of multiple passes. It adjusts certain heuristics
+    // for constraint solving.
+    ArgAssignmentFirstPass = 1 << 3,
+
+    // If the dest is not Any but the src is Any, treat it
+    // as incompatible. Also, treat all source TypeVars as their
+    // concrete counterparts. This option is used for validating
+    // whether overload signatures overlap.
+    OverloadOverlap = 1 << 4,
+
+    // When used in conjunction with OverloadOverlapCheck, look
+    // for partial overlaps. For example, `int | list` overlaps
+    // partially with `int | str`.
+    PartialOverloadOverlap = 1 << 5,
+
+    // For function types, skip the return type check.
+    SkipReturnTypeCheck = 1 << 6,
+
+    // In most cases, literals are stripped when assigning to a
+    // type variable. This overrides the standard behavior.
+    RetainLiteralsForTypeVar = 1 << 8,
+
+    // When validating the type of a self or cls parameter, allow
+    // a type mismatch. This is used in overload consistency validation
+    // because overloads can provide explicit type annotations for self
+    // or cls.
+    SkipSelfClsTypeCheck = 1 << 9,
+
+    // We're initially populating the constraints with an expected type,
+    // so TypeVars should match the specified type exactly rather than
+    // employing narrowing or widening. The variance context determines
+    // whether the upper bound, lower bound, or both are established.
+    PopulateExpectedType = 1 << 11,
+
+    // Used with PopulatingExpectedType, this flag indicates that a TypeVar
+    // constraint that is Unknown should be ignored.
+    SkipPopulateUnknownExpectedType = 1 << 12,
+
+    // Normally, when a class type is assigned to a TypeVar and that class
+    // hasn't previously been specialized, it will be specialized with
+    // default type arguments (typically "Unknown"). This flag skips
+    // this step.
+    AllowUnspecifiedTypeArgs = 1 << 13,
+
+    // Normally all special form classes are incompatible with type[T],
+    // but a few of them are allowed in the context of an isinstance
+    // or issubclass call.
+    AllowIsinstanceSpecialForms = 1 << 14,
+
+    // When comparing two methods, skip the type check for the "self" or "cls"
+    // parameters. This is used for variance inference and validation.
+    SkipSelfClsParamCheck = 1 << 15,
+
+    // Normally a protocol class object cannot be used as a source type. This
+    // option overrides this behavior.
+    AllowProtocolClassSource = 1 << 16,
 }
 
 export interface TypeEvaluator {
@@ -551,7 +651,7 @@ export interface TypeEvaluator {
     ) => Type;
 
     getExpectedType: (node: ExpressionNode) => ExpectedTypeResult | undefined;
-    verifyRaiseExceptionType: (node: RaiseNode) => void;
+    verifyRaiseExceptionType: (node: ExpressionNode, allowNone: boolean) => void;
     verifyDeleteExpression: (node: ExpressionNode) => void;
     validateOverloadedArgTypes: (
         errorNode: ExpressionNode,
@@ -599,6 +699,8 @@ export interface TypeEvaluator {
     ) => TypeResult | undefined;
     getGetterTypeFromProperty: (propertyClass: ClassType, inferTypeIfNeeded: boolean) => Type | undefined;
     getTypeOfArg: (arg: Arg, inferenceContext: InferenceContext | undefined) => TypeResult;
+    convertNodeToArg: (node: ArgumentNode) => ArgWithExpression;
+    buildTupleTypesList: (entryTypeResults: TypeResult[], stripLiterals: boolean) => TupleTypeArg[];
     markNamesAccessed: (node: ParseNode, names: string[]) => void;
     expandPromotionTypes: (node: ParseNode, type: Type) => Type;
     makeTopLevelTypeVarsConcrete: (type: Type, makeParamSpecsConcrete?: boolean) => Type;
@@ -618,8 +720,8 @@ export interface TypeEvaluator {
     ) => EffectiveTypeResult;
     getInferredTypeOfDeclaration: (symbol: Symbol, decl: Declaration) => Type | undefined;
     getDeclaredTypeForExpression: (expression: ExpressionNode, usage?: EvaluatorUsage) => Type | undefined;
-    getFunctionDeclaredReturnType: (node: FunctionNode) => Type | undefined;
-    getFunctionInferredReturnType: (type: FunctionType, callSiteInfo?: CallSiteEvaluationInfo) => Type;
+    getDeclaredReturnType: (node: FunctionNode) => Type | undefined;
+    getInferredReturnType: (type: FunctionType, callSiteInfo?: CallSiteEvaluationInfo) => Type;
     getBestOverloadForArgs: (
         errorNode: ExpressionNode,
         typeResult: TypeResult<OverloadedType>,
@@ -659,6 +761,7 @@ export interface TypeEvaluator {
         diag?: DiagnosticAddendum,
         recursionCount?: number
     ) => FunctionType | OverloadedType | undefined;
+    getCallbackProtocolType: (objType: ClassType, recursionCount?: number) => FunctionType | OverloadedType | undefined;
     getCallSignatureInfo: (node: CallNode, activeIndex: number, activeOrFake: boolean) => CallSignatureInfo | undefined;
     getAbstractSymbols: (classType: ClassType) => AbstractSymbol[];
     narrowConstrainedTypeVar: (node: ParseNode, typeVar: TypeVarType) => Type | undefined;
@@ -692,6 +795,8 @@ export interface TypeEvaluator {
     getBuiltInObject: (node: ParseNode, name: string, typeArgs?: Type[]) => Type;
     getTypedDictClassType: () => ClassType | undefined;
     getTupleClassType: () => ClassType | undefined;
+    getDictClassType: () => ClassType | undefined;
+    getStrClassType: () => ClassType | undefined;
     getObjectType: () => Type;
     getNoneType: () => Type;
     getUnionClassType(): Type;

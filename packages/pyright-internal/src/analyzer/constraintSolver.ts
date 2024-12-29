@@ -13,7 +13,12 @@ import { DiagnosticAddendum } from '../common/diagnostic';
 import { LocAddendum } from '../localization/localize';
 import { ConstraintSolution, ConstraintSolutionSet } from './constraintSolution';
 import { ConstraintSet, ConstraintTracker, TypeVarConstraints } from './constraintTracker';
-import { maxSubtypesForInferredType, SolveConstraintsOptions, TypeEvaluator } from './typeEvaluatorTypes';
+import {
+    AssignTypeFlags,
+    maxSubtypesForInferredType,
+    SolveConstraintsOptions,
+    TypeEvaluator,
+} from './typeEvaluatorTypes';
 import {
     ClassType,
     combineTypes,
@@ -40,13 +45,11 @@ import {
     TypeVarKind,
     TypeVarScopeId,
     TypeVarType,
-    UnknownType,
     Variance,
 } from './types';
 import {
     addConditionToType,
     applySolvedTypeVars,
-    AssignTypeFlags,
     buildSolutionFromSpecializedClass,
     convertToInstance,
     convertToInstantiable,
@@ -57,6 +60,8 @@ import {
     isEffectivelyInstantiable,
     isLiteralTypeOrUnion,
     isPartlyUnknown,
+    makePacked,
+    makeUnpacked,
     mapSubtypes,
     simplifyFunctionToParamSpec,
     sortTypes,
@@ -105,6 +110,12 @@ export function assignTypeVar(
         }
     }
 
+    // If both src and dest types are packed, unpack them both.
+    if (isUnpacked(destType) && isUnpacked(srcType)) {
+        destType = TypeVarType.cloneForPacked(destType);
+        srcType = makePacked(srcType);
+    }
+
     // If the TypeVar doesn't have a scope ID, then it's being used
     // outside of a valid TypeVar scope. This will be reported as a
     // separate error. Just ignore this case to avoid redundant errors.
@@ -135,17 +146,22 @@ export function assignTypeVar(
         isAssignable = assignParamSpec(evaluator, destType, srcType, diag, constraints, recursionCount);
     } else {
         if (isTypeVarTuple(destType) && !destType.priv.isInUnion) {
-            const tupleClassType = evaluator.getTupleClassType();
-            if (!isUnpacked(srcType) && tupleClassType) {
-                // Package up the type into a tuple.
-                srcType = convertToInstance(
-                    specializeTupleClass(
-                        tupleClassType,
-                        [{ type: srcType, isUnbounded: false }],
-                        /* isTypeArgExplicit */ true,
-                        /* isUnpacked */ true
-                    )
-                );
+            if (destType.priv.isUnpacked) {
+                const tupleClassType = evaluator.getTupleClassType();
+
+                if (!isUnpacked(srcType) && tupleClassType) {
+                    // Package up the type into a tuple.
+                    srcType = convertToInstance(
+                        specializeTupleClass(
+                            tupleClassType,
+                            [{ type: srcType, isUnbounded: false }],
+                            /* isTypeArgExplicit */ true,
+                            /* isUnpacked */ true
+                        )
+                    );
+                }
+            } else {
+                srcType = makeUnpacked(srcType);
             }
         }
 
@@ -472,23 +488,17 @@ export function addConstraintsForExpectedType(
                         typeArgValue = transformExpectedType(typeArgValue, liveTypeVarScopes, usageOffset);
                     }
 
-                    if (typeArgValue) {
-                        const variance = TypeVarType.getVariance(typeVar);
-
-                        // If this type variable already has a type, don't overwrite it. This can
-                        // happen if a single type variable in the derived class is used multiple times
-                        // in the specialized base class type (e.g. Mapping[T, T]).
-                        if (constraints.getMainConstraintSet().getTypeVar(targetTypeVar)) {
-                            isResultValid = false;
-                            typeArgValue = UnknownType.create();
-                        }
-
-                        constraints.setBounds(
+                    if (
+                        !typeArgValue ||
+                        !assignTypeVar(
+                            evaluator,
                             targetTypeVar,
-                            variance === Variance.Covariant ? undefined : typeArgValue,
-                            variance === Variance.Contravariant ? undefined : typeArgValue
-                        );
-                    } else {
+                            typeArgValue,
+                            /* diag */ undefined,
+                            constraints,
+                            AssignTypeFlags.RetainLiteralsForTypeVar
+                        )
+                    ) {
                         isResultValid = false;
                     }
                 }
@@ -583,9 +593,9 @@ function assignBoundTypeVar(
         return true;
     }
 
-    // Never is always assignable in a covariant context.
-    const isCovariant = (flags & (AssignTypeFlags.Invariant | AssignTypeFlags.Contravariant)) === 0;
-    if (isNever(srcType) && isCovariant) {
+    // Never is always assignable except in an invariant context.
+    const isInvariant = (flags & AssignTypeFlags.Invariant) !== 0;
+    if (isNever(srcType) && !isInvariant) {
         return true;
     }
 
@@ -803,16 +813,6 @@ function assignUnconstrainedTypeVar(
                 // source type.
                 newLowerBound = adjSrcType;
             } else {
-                // We need to widen the type.
-                if (constraints?.isLocked()) {
-                    diag?.addMessage(
-                        LocAddendum.typeAssignmentMismatch().format(
-                            evaluator.printSrcDestTypes(adjSrcType, curLowerBound)
-                        )
-                    );
-                    return false;
-                }
-
                 if (
                     evaluator.assignType(
                         adjSrcType,
@@ -823,7 +823,12 @@ function assignUnconstrainedTypeVar(
                         recursionCount
                     )
                 ) {
-                    newLowerBound = adjSrcType;
+                    // If the source is a TypeVar that just got assigned the value
+                    // of the current lower bound, don't replace the current lower
+                    // bound with the TypeVar.
+                    if (!isTypeVar(adjSrcType)) {
+                        newLowerBound = adjSrcType;
+                    }
                 } else if (isTypeVarTuple(destType)) {
                     const widenedType = widenTypeForTypeVarTuple(evaluator, curLowerBound, adjSrcType);
                     if (!widenedType) {
@@ -970,14 +975,12 @@ function assignUnconstrainedTypeVar(
         }
     }
 
-    if (constraints && !constraints.isLocked()) {
-        constraints.setBounds(
-            destType,
-            newLowerBound,
-            newUpperBound,
-            (flags & (AssignTypeFlags.PopulateExpectedType | AssignTypeFlags.RetainLiteralsForTypeVar)) !== 0
-        );
-    }
+    constraints?.setBounds(
+        destType,
+        newLowerBound,
+        newUpperBound,
+        (flags & (AssignTypeFlags.PopulateExpectedType | AssignTypeFlags.RetainLiteralsForTypeVar)) !== 0
+    );
 
     return true;
 }
@@ -1156,9 +1159,7 @@ function assignConstrainedTypeVar(
                     recursionCount
                 )
             ) {
-                if (constraints && !constraints.isLocked()) {
-                    constraints.setBounds(destType, constrainedType, curUpperBound);
-                }
+                constraints?.setBounds(destType, constrainedType, curUpperBound);
             } else {
                 diag?.addMessage(
                     LocAddendum.typeConstrainedTypeVar().format({
@@ -1171,9 +1172,7 @@ function assignConstrainedTypeVar(
         }
     } else {
         // Assign the type to the type var.
-        if (constraints && !constraints.isLocked()) {
-            constraints.setBounds(destType, constrainedType, curUpperBound, retainLiterals);
-        }
+        constraints?.setBounds(destType, constrainedType, curUpperBound, retainLiterals);
     }
 
     return true;
@@ -1215,9 +1214,7 @@ function assignParamSpec(
                     }
                 }
             } else {
-                if (!constraints.isLocked()) {
-                    constraintSet.setBounds(destType, adjSrcType);
-                }
+                constraintSet.setBounds(destType, adjSrcType);
                 return;
             }
         } else if (isFunction(adjSrcType)) {
@@ -1272,9 +1269,7 @@ function assignParamSpec(
             }
 
             if (updateContextWithNewFunction) {
-                if (!constraints.isLocked()) {
-                    constraintSet.setBounds(destType, newFunction);
-                }
+                constraintSet.setBounds(destType, newFunction);
                 return;
             }
         } else if (isAnyOrUnknown(adjSrcType)) {
